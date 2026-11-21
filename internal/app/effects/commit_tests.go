@@ -1,0 +1,170 @@
+package effects
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/prathameshk421/flip_the_switch_hackathon/internal/domain/change"
+	"github.com/prathameshk421/flip_the_switch_hackathon/internal/domain/id"
+	"github.com/prathameshk421/flip_the_switch_hackathon/internal/domain/testset"
+	"github.com/prathameshk421/flip_the_switch_hackathon/internal/domain/workflow"
+	"github.com/prathameshk421/flip_the_switch_hackathon/internal/ports"
+)
+
+// CommitTestsDeps are the dependencies of CommitTests.
+type CommitTestsDeps struct {
+	Blobs    ports.BlobStore
+	Branches ports.BranchWriter
+	Ingest   Ingest
+	IDs      ports.IDs
+	Clock    ports.Clock
+	Code     ports.CodeReader
+}
+
+// CommitTests performs github_commit_tests effects: it commits verified tests to the test branch
+// and records tests.committed.
+type CommitTests struct {
+	deps CommitTestsDeps
+}
+
+// NewCommitTests builds the executor, or refuses when a dependency is missing.
+func NewCommitTests(d CommitTestsDeps) (CommitTests, error) {
+	var missing []string
+	if d.Blobs == nil {
+		missing = append(missing, "blobs")
+	}
+	if d.Branches == nil {
+		missing = append(missing, "branches")
+	}
+	if d.Ingest == nil {
+		missing = append(missing, "ingest")
+	}
+	if d.IDs == nil {
+		missing = append(missing, "ids")
+	}
+	if d.Clock == nil {
+		missing = append(missing, "clock")
+	}
+	if len(missing) > 0 {
+		return CommitTests{}, fmt.Errorf("github_commit_tests executor: missing %v", missing)
+	}
+	return CommitTests{deps: d}, nil
+}
+
+// Execute commits the tests and records tests.committed.
+func (c CommitTests) Execute(ctx context.Context, fx change.Effect) error {
+	if fx.Kind != change.EffectGitHubCommitTests {
+		return failf(nil, "commit_tests executor: effect %s has kind %s", fx.Key, fx.Kind)
+	}
+	p, err := change.DecodeCommitTestsPayload(fx.Payload)
+	if err != nil {
+		return failf(err, "commit_tests effect %s: payload refused: %v", fx.Key, err)
+	}
+	ticket, err := changeOfEffect(p.Change, fx.Key)
+	if err != nil {
+		return failf(err, "commit_tests effect %s: extract ticket", fx.Key)
+	}
+
+	files, err := c.readFiles(ctx, ticket, p.Files)
+	if err != nil {
+		return err
+	}
+
+	sha, err := c.deps.Branches.CommitFiles(ctx, p.Repo, p.Branch, p.Message, files)
+	if err != nil {
+		return failf(err, "commit_tests %s: commit files", ticket)
+	}
+
+	treeHash, err := c.treeHash(ctx, p.Repo, sha, p.Dir)
+	if err != nil {
+		return failf(err, "commit_tests %s: pin tests tree", ticket)
+	}
+	return c.ingestCommitted(ctx, ticket, sha, treeHash)
+}
+
+// readFiles returns the content of each file to commit. A commit file's blob is the stored submission, so the file
+// is looked up in it by path: the executor commits the test source, never the submission JSON.
+func (c CommitTests) readFiles(ctx context.Context, ticket id.ChangeID, cf []change.CommitFile) ([]ports.File, error) {
+	bundles := map[workflow.BlobRef]testset.Submission{}
+	files := make([]ports.File, 0, len(cf))
+	for _, f := range cf {
+		sub, ok := bundles[f.BlobRef]
+		if !ok {
+			var err error
+			if sub, err = c.readSubmission(ctx, ticket, f.BlobRef); err != nil {
+				return nil, err
+			}
+			bundles[f.BlobRef] = sub
+		}
+		idx := slices.IndexFunc(sub.Files, func(sf testset.File) bool { return sf.Path == f.Path })
+		if idx < 0 {
+			return nil, failf(nil, "commit_tests %s: the submission %s has no file %s", ticket, f.BlobRef, f.Path)
+		}
+		files = append(files, ports.File{Path: f.Path, Content: []byte(sub.Files[idx].Content)})
+	}
+	return files, nil
+}
+
+func (c CommitTests) readSubmission(ctx context.Context, ticket id.ChangeID, ref workflow.BlobRef) (testset.Submission, error) {
+	rc, err := c.deps.Blobs.Get(ctx, ref)
+	if err != nil {
+		return testset.Submission{}, failf(err, "commit_tests %s: get blob %s", ticket, ref)
+	}
+	var sub testset.Submission
+	err = json.NewDecoder(rc).Decode(&sub)
+	_ = rc.Close()
+	if err != nil {
+		return testset.Submission{}, failf(err, "commit_tests %s: decode submission blob %s", ticket, ref)
+	}
+	return sub, nil
+}
+
+func (c CommitTests) treeHash(ctx context.Context, repo change.Repo, sha id.SHA, dir string) (id.SHA, error) {
+	if c.deps.Code == nil {
+		return "", fmt.Errorf("code reader is required to pin %s at %s", dir, sha)
+	}
+	th, err := c.deps.Code.TreeHash(ctx, repo, sha, dir)
+	if err != nil {
+		return "", fmt.Errorf("read tree hash: %w", err)
+	}
+	if th == "" {
+		return "", fmt.Errorf("empty tree hash for %s at %s", dir, sha)
+	}
+	return th, nil
+}
+
+func (c CommitTests) ingestCommitted(ctx context.Context, ticket id.ChangeID, sha, treeHash id.SHA) error {
+	payload := change.TestsCommitted{SHA: sha, TreeHash: treeHash}
+	if err := payload.Validate(); err != nil {
+		return failf(err, "commit_tests %s: tests.committed refused", ticket)
+	}
+	ev, err := newFact(c.deps.IDs, c.deps.Clock, change.EventTestsCommitted,
+		change.Actor{Kind: change.ActorGitHub, ID: githubActorID}, payload)
+	if err != nil {
+		return failf(err, "commit_tests %s: build event", ticket)
+	}
+	if err := c.deps.Ingest.Ingest(ctx, ticket, []change.Event{ev}); err != nil {
+		return failf(err, "commit_tests %s: ingest tests.committed", ticket)
+	}
+	return nil
+}
+
+// changeOfEffect is the change an effect is about: the payload names it; an effect made before payloads did names it in
+// its key (kind:change:version:discriminator). // Old effects only.
+func changeOfEffect(fromPayload id.ChangeID, k change.EffectKey) (id.ChangeID, error) {
+	if fromPayload != "" {
+		return fromPayload, nil
+	}
+	return ticketFromKey(k)
+}
+
+func ticketFromKey(k change.EffectKey) (id.ChangeID, error) {
+	parts := strings.Split(string(k), ":")
+	if len(parts) < 3 {
+		return "", fmt.Errorf("malformed effect key %q", k)
+	}
+	return id.ParseChangeID(parts[1])
+}
